@@ -2,6 +2,7 @@
 #include "globals.hpp"
 
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/render/Context.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/output/MonitorResources.hpp>
@@ -54,7 +55,7 @@ static GLuint compileShader(GLenum type, const char* src) {
         char  log[1024] = {0};
         GLint len       = 0;
         glGetShaderInfoLog(shader, sizeof(log) - 1, &len, log);
-        Log::logger->log(Log::ERR, "[omarchy-fx] shader compile failed: {}", log);
+        LOG(Log::ERR, "[omarchy-fx] shader compile failed: {}", log);
         glDeleteShader(shader);
         return 0;
     }
@@ -91,7 +92,7 @@ bool CMeshTransformer::ensureProgram() {
         char  log[1024] = {0};
         GLint len       = 0;
         glGetProgramInfoLog(prog, sizeof(log) - 1, &len, log);
-        Log::logger->log(Log::ERR, "[omarchy-fx] program link failed: {}", log);
+        LOG(Log::ERR, "[omarchy-fx] program link failed: {}", log);
         glDeleteProgram(prog);
         return false;
     }
@@ -128,15 +129,19 @@ CMeshTransformer::~CMeshTransformer() {
         m_state->alive = false;
 }
 
-void CMeshTransformer::preWindowRender(CSurfacePassElement::SRenderData* pRenderData) {
-    // Snapshot and standalone passes never call amendTransformedRenderData, so
-    // this is how we learn that the box we are about to get handed is stale.
-    m_boxValid = false;
+bool CMeshTransformer::active() const {
+    return m_state && m_state->alive;
 }
 
-void CMeshTransformer::amendTransformedRenderData(const CBox& currentBox, SMotionBlurData* pMotionBlurData) {
-    m_currentBox = currentBox;
-    m_boxValid   = true;
+CBox CMeshTransformer::transformedExtents(const CBox& currentBox) const {
+    double margin = 0;
+    for (const auto& offset : m_state->offsets)
+        margin = std::max(margin, offset.size());
+    return currentBox.copy().expand(margin * 2 + 8);
+}
+
+CBox CMeshTransformer::sourceBoxForOutput(const CBox& outputBox, const CBox& inputBox) const {
+    return inputBox;
 }
 
 // Cubic Bernstein weights, the basis of the Bezier surface the control lattice
@@ -149,22 +154,22 @@ static void bernstein(double t, double out[4]) {
     out[3]         = t * t * t;
 }
 
-SP<Render::IFramebuffer> CMeshTransformer::transform(SP<Render::IFramebuffer> in) {
-    if (!m_state || !m_boxValid)
+Render::SWindowTransformBuffer CMeshTransformer::transform(Render::CRenderContext& ctx, const Render::SWindowTransformBuffer& in, const Render::SWindowTransformContext& context) {
+    if (!m_state || context.standalone || context.renderingSnapshot)
         return in;
 
+    m_currentBox = context.currentBox;
     if (m_currentBox.w <= 0 || m_currentBox.h <= 0 || m_state->frameSize.x <= 0 || m_state->frameSize.y <= 0)
         return in;
 
-    const auto PMONITOR = g_pHyprRenderer->m_renderData.pMonitor.lock();
-    if (!PMONITOR || !in || !in->getTexture())
+    const auto PMONITOR = context.monitor.lock();
+    if (!PMONITOR || !in.framebuffer || !in.framebuffer->getTexture())
         return in;
 
-    const auto RESOURCES = PMONITOR->resources();
-    if (!RESOURCES)
+    const auto CANVAS = Render::pixelBoxForLogical(context.outputBox.copy().expand(1.0 / PMONITOR->m_scale), PMONITOR->m_scale);
+    if (CANVAS.empty())
         return in;
-
-    const auto OUT = RESOURCES->getUnusedWorkBuffer();
+    const auto OUT = g_pHyprRenderer->getWorkBuffer(ctx, CANVAS.size());
     if (!OUT || !OUT->isAllocated())
         return in;
 
@@ -172,7 +177,7 @@ SP<Render::IFramebuffer> CMeshTransformer::transform(SP<Render::IFramebuffer> in
         return in;
 
     const auto&  OFFSETS = m_state->offsets;
-    const auto   FBSIZE  = in->m_size;
+    const auto   FBSIZE  = in.framebuffer->m_size;
     const double SCALE  = PMONITOR->m_scale;
 
     if (FBSIZE.x <= 0 || FBSIZE.y <= 0)
@@ -190,8 +195,11 @@ SP<Render::IFramebuffer> CMeshTransformer::transform(SP<Render::IFramebuffer> in
     // Normalised coordinates inside the work framebuffer. Positions and texture
     // coordinates share this space, so an undeformed lattice is a pixel-exact
     // copy of the input.
-    const auto norm = [&FBSIZE, SCALE](const Vector2D& logical) -> Vector2D {
-        return Vector2D{(logical.x * SCALE) / FBSIZE.x, (logical.y * SCALE) / FBSIZE.y};
+    const auto texNorm = [&FBSIZE, &in, SCALE](const Vector2D& logical) -> Vector2D {
+        return Vector2D{(logical.x * SCALE - in.box.x) / FBSIZE.x, (logical.y * SCALE - in.box.y) / FBSIZE.y};
+    };
+    const auto outNorm = [&CANVAS, SCALE](const Vector2D& logical) -> Vector2D {
+        return Vector2D{(logical.x * SCALE - CANVAS.x) / CANVAS.w, (logical.y * SCALE - CANVAS.y) / CANVAS.h};
     };
 
     // Bernstein weights along each axis, evaluated once per mesh line.
@@ -237,8 +245,8 @@ SP<Render::IFramebuffer> CMeshTransformer::transform(SP<Render::IFramebuffer> in
 
     const auto emit = [&](int i, int j) {
         const auto R = Vector2D{m_currentBox.x + (m_currentBox.w * i) / TESS, m_currentBox.y + (m_currentBox.h * j) / TESS};
-        const auto P = norm(R + m_grid[j * SIDE + i]);
-        const auto T = norm(R);
+        const auto P = outNorm(R + m_grid[j * SIDE + i]);
+        const auto T = texNorm(R);
         m_verts.push_back(sc<float>(P.x));
         m_verts.push_back(sc<float>(P.y));
         m_verts.push_back(sc<float>(T.x));
@@ -257,9 +265,6 @@ SP<Render::IFramebuffer> CMeshTransformer::transform(SP<Render::IFramebuffer> in
         }
     }
 
-    const auto PROJ = g_pHyprRenderer->projectBoxToTarget(CBox{0.0, 0.0, FBSIZE.x, FBSIZE.y});
-    const auto MAT  = PROJ.getMatrix();
-
     // Save the bits of GL state Hyprland assumes it still owns.
     GLint oldProgram = 0, oldVAO = 0, oldArrayBuffer = 0, oldTexture = 0, oldUnit = GL_TEXTURE0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &oldProgram);
@@ -270,7 +275,11 @@ SP<Render::IFramebuffer> CMeshTransformer::transform(SP<Render::IFramebuffer> in
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture);
 
     {
-        const auto GUARD = g_pHyprRenderer->bindTempFB(OUT);
+        const auto GUARD = g_pHyprRenderer->bindTempFB(ctx, OUT);
+        const auto STATE = ctx.saveDrawState();
+        ctx.m_data.fbSize = CANVAS.size();
+        g_pHyprRenderer->setProjectionType(ctx, Render::RPT_EXPORT);
+        const auto MAT = g_pHyprRenderer->projectBoxToTarget(ctx, CBox{0.0, 0.0, CANVAS.w, CANVAS.h}).getMatrix();
 
         g_pHyprRenderer->disableScissor();
         g_pHyprRenderer->blend(false);
@@ -283,7 +292,7 @@ SP<Render::IFramebuffer> CMeshTransformer::transform(SP<Render::IFramebuffer> in
         glUniformMatrix3fv(g_uProj, 1, GL_TRUE, MAT.data());
 
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, in->getTexture()->m_texID);
+        glBindTexture(GL_TEXTURE_2D, in.framebuffer->getTexture()->m_texID);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -311,5 +320,5 @@ SP<Render::IFramebuffer> CMeshTransformer::transform(SP<Render::IFramebuffer> in
     glUseProgram(oldProgram);
     g_pHyprRenderer->blend(true);
 
-    return OUT;
+    return {.framebuffer = OUT, .box = CANVAS};
 }

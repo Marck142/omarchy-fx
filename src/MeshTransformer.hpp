@@ -16,9 +16,10 @@ namespace OmarchyFX {
         CMeshTransformer(SP<SMeshState> state);
         virtual ~CMeshTransformer();
 
-        virtual SP<Render::IFramebuffer> transform(SP<Render::IFramebuffer> in);
-        virtual void                     preWindowRender(CSurfacePassElement::SRenderData* pRenderData);
-        virtual void                     amendTransformedRenderData(const CBox& currentBox, SMotionBlurData* pMotionBlurData);
+        Render::SWindowTransformBuffer transform(Render::CRenderContext& ctx, const Render::SWindowTransformBuffer& in, const Render::SWindowTransformContext& context) override;
+        bool active() const override;
+        CBox transformedExtents(const CBox& currentBox) const override;
+        CBox sourceBoxForOutput(const CBox& outputBox, const CBox& inputBox) const override;
 
         static void                      dropProgram();
 
@@ -30,7 +31,6 @@ namespace OmarchyFX {
         // Window bounding box for this frame, monitor-local and unscaled, as
         // handed to us right before the transformed pass is submitted.
         CBox                  m_currentBox;
-        bool                  m_boxValid = false;
 
         std::vector<float>    m_verts; // x, y, u, v per vertex
         std::vector<Vector2D> m_grid;

@@ -76,7 +76,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (SERVER != CLIENT) {
         HyprlandAPI::addNotification(PHANDLE, "[omarchy-fx] Version mismatch, refusing to load. Rebuild the plugin against this Hyprland.",
                                      CHyprColor{1.0, 0.2, 0.2, 1.0}, 6000);
-        Log::logger->log(Log::ERR, "[omarchy-fx] version mismatch: server '{}' vs plugin '{}'", SERVER, CLIENT);
+        LOG(Log::ERR, "[omarchy-fx] version mismatch: server '{}' vs plugin '{}'", SERVER, CLIENT);
         throw std::runtime_error("[omarchy-fx] version mismatch");
     }
 
